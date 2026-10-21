@@ -537,7 +537,7 @@ impl Daemon {
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
                 None => ("queued".into(), "queued: the session is offline; delivered when it is back".into()),
             };
-            if msg.notify { (state, format!("{note}; {}", self.notify(&msg).1)) } else { (state, note) }
+            if msg.notify && !held { (state, format!("{note}; {}", self.notify(&msg).1)) } else { (state, note) }
         };
         self.arrived.notify_waiters();
         // The sender's session can be answered right away, before its machine's next presence names it.
@@ -666,6 +666,9 @@ fn approval_holds(a: &Signed<Approval>, team: &str, peer: &EndpointId, sender: &
 
 /// Validates a message from a peer and strips its metadata down to safe characters.
 fn clean(m: Message) -> Result<Message> {
+    if m.body.len() > MAX_BODY {
+        bail!("message is over {} KB; send a small text file or a link", MAX_BODY / 1024);
+    }
     let ok = |s: &str, extra: &str| {
         !s.is_empty() && s.len() <= 120 && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
     };
@@ -743,6 +746,30 @@ mod tests {
         for bad in [id.to_lowercase(), "CON".into(), "01ALICEMSG".into(), format!("{id}0"), String::new()] {
             assert!(clean(msg(&bad)).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_peers_message_body_is_limited_in_bytes() {
+        let msg = |body: String| Message {
+            id: Ulid::new().to_string(),
+            from: "bob/terminal".into(),
+            from_agent: None,
+            from_repo: None,
+            to: "alex/web".into(),
+            via: None,
+            reply_to: None,
+            body,
+            wake: true,
+            notify: false,
+            sent_at: 0,
+            approval: None,
+            files: Vec::new(),
+        };
+        assert!(clean(msg("x".repeat(MAX_BODY))).is_ok());
+        assert!(clean(msg("x".repeat(MAX_BODY + 1))).is_err());
+        // The wire limit is bytes, including multibyte UTF-8 text.
+        assert!(clean(msg("é".repeat(MAX_BODY / 2))).is_ok());
+        assert!(clean(msg("é".repeat(MAX_BODY / 2 + 1))).is_err());
     }
 
     fn approval(asker: &str, approver: &str) -> Approval {

@@ -1,0 +1,39 @@
+name: controlled-build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+          targets: aarch64-apple-darwin
+      - run: cargo fmt --check
+      - run: cargo fetch --locked
+      - run: cargo clippy --all-targets --frozen -- -D warnings
+      - run: cargo test --frozen
+      - run: cargo build --release --frozen --target aarch64-apple-darwin
+      - name: Record exact source and binary hash
+        run: |
+          mkdir dist
+          cp target/aarch64-apple-darwin/release/reason-network dist/
+          git rev-parse HEAD > dist/SOURCE_COMMIT
+          rustc --version > dist/RUST_VERSION
+          shasum -a 256 Cargo.lock > dist/LOCKFILE_SHA256
+          cd dist
+          shasum -a 256 reason-network > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: reason-network-controlled-aarch64-apple-darwin
+          path: dist/
+          retention-days: 30

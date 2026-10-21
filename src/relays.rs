@@ -21,6 +21,9 @@ use std::{
     time::Duration,
 };
 
+// Controlled fork: relay destinations change only with reviewed source changes.
+const DYNAMIC_RELAYS: bool = false;
+
 pub const URL: &str = "https://reasonmachines.com/network/relays.json";
 const TYPE: &str = "reason-network-relays";
 const ISSUER: &str = "https://reasonmachines.com/network/relays";
@@ -114,6 +117,9 @@ fn cached(home: &Path) -> Option<List> {
 
 /// The relays to use: the cached list, else the built-in default.
 pub fn current() -> Vec<RelayUrl> {
+    if !DYNAMIC_RELAYS {
+        return crate::net::default_relays();
+    }
     current_in(&crate::paths::home())
 }
 
@@ -124,6 +130,9 @@ fn current_in(home: &Path) -> Vec<RelayUrl> {
 /// The same, fetching the list first if none is cached yet (a machine's first network start), for at most
 /// `FIRST_WAIT`.
 pub async fn current_or_fetch() -> Vec<RelayUrl> {
+    if !DYNAMIC_RELAYS {
+        return crate::net::default_relays();
+    }
     current_or_fetch_in(crate::paths::home(), url()).await
 }
 
@@ -144,6 +153,9 @@ async fn current_or_fetch_in(home: PathBuf, url: String) -> Vec<RelayUrl> {
 
 /// Fetches the list and, if good, keeps it; says why not otherwise.
 pub async fn refresh() {
+    if !DYNAMIC_RELAYS {
+        return;
+    }
     if let Err(e) = refresh_in(&crate::paths::home(), &url()).await {
         log(&format!("{e:#}; keeping the relays this machine has"));
     }
@@ -223,6 +235,12 @@ mod tests {
     use super::*;
     use crate::proof::tests::{KID, forger, sign_with, signer};
     use serde_json::{Value, json};
+
+    #[tokio::test]
+    async fn controlled_build_uses_only_the_reviewed_default_relay_list() {
+        assert_eq!(current(), crate::net::default_relays());
+        assert_eq!(current_or_fetch().await, crate::net::default_relays());
+    }
 
     fn region(r: &str) -> String {
         format!("https://relay-{r}.compute.reasonmachines.com")

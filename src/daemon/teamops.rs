@@ -96,7 +96,11 @@ impl Daemon {
     }
 
     pub fn outbox_for(&self, id: &EndpointId) -> Vec<Message> {
-        self.inner.lock().unwrap().store.outbox_for(&id.to_string(), util::now_ms()).unwrap_or_default()
+        let g = self.inner.lock().unwrap();
+        if !g.team.as_ref().is_some_and(|t| t.is_active(id)) {
+            return Vec::new();
+        }
+        g.store.outbox_for(&id.to_string(), util::now_ms()).unwrap_or_default()
     }
 
     pub fn outbox_done(&self, id: &str) {
@@ -655,6 +659,43 @@ fn sign_in_needs_a_link(invite_text: &str, proof: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_messages_are_not_released_to_removed_or_unknown_peers() {
+        let d = super::super::test_daemon(Config::default());
+        let bob = iroh::SecretKey::generate().public();
+        let stranger = iroh::SecretKey::generate().public();
+        let mut team = TeamState::found("test", "alice", "laptop", &d.key);
+        team.put_member(&d.key, bob, "bob", "desktop", true);
+        let msg = Message {
+            id: ulid::Ulid::new().to_string(),
+            from: "alice/api".into(),
+            from_agent: None,
+            from_repo: None,
+            to: "bob/web".into(),
+            via: None,
+            reply_to: None,
+            body: "private queued message".into(),
+            wake: false,
+            notify: false,
+            sent_at: util::now_ms(),
+            approval: None,
+            files: Vec::new(),
+        };
+        {
+            let mut g = d.inner.lock().unwrap();
+            g.team = Some(team);
+            g.store.outbox_add(&bob.to_string(), &msg).unwrap();
+            let other = Message { id: ulid::Ulid::new().to_string(), ..msg.clone() };
+            g.store.outbox_add(&stranger.to_string(), &other).unwrap();
+        }
+        assert_eq!(d.outbox_for(&bob).len(), 1);
+        assert!(d.outbox_for(&stranger).is_empty());
+        d.inner.lock().unwrap().team.as_mut().unwrap().put_member(&d.key, bob, "bob", "desktop", false);
+        assert!(d.outbox_for(&bob).is_empty());
+        d.inner.lock().unwrap().team = None;
+        assert!(d.outbox_for(&bob).is_empty());
+    }
 
     #[test]
     fn a_sign_in_never_joins_with_a_code() {

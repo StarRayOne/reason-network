@@ -9,7 +9,6 @@ mod notify;
 mod reason;
 mod sessions;
 mod teamops;
-mod update;
 
 use crate::{
     config::Config,
@@ -72,9 +71,6 @@ pub async fn run(service: bool) -> Result<()> {
     }
     tokio::spawn(crate::migrate::run(log));
     tokio::spawn(daemon.clone().relays_loop());
-    if update::allowed(daemon.cfg.auto_update) {
-        tokio::spawn(daemon.clone().update_loop());
-    }
     loop {
         let stream = listener.accept().await?;
         tokio::spawn(daemon.clone().serve(stream));
@@ -175,7 +171,7 @@ pub fn load_key() -> Result<SecretKey> {
 
 impl Daemon {
     fn open() -> Result<Self> {
-        Self::with(Config::load(), Store::open(&paths::db(), paths::inbox())?, load_key()?)
+        Self::with(Config::load_strict()?, Store::open(&paths::db(), paths::inbox())?, load_key()?)
     }
 
     fn with(cfg: Config, store: Store, key: SecretKey) -> Result<Self> {

@@ -139,7 +139,7 @@ pub async fn onboard(
         }
     }
 
-    set_up_agents_with_defaults().await?;
+    agents_and_preferences().await?;
 
     if start {
         let url = show_link(false).await?;
@@ -153,37 +153,6 @@ pub async fn onboard(
         outro("You're in. Ask any of your agents: \"who's on the team?\"")?;
     }
     Ok(())
-}
-
-/// Every agent found, the background service, the default preferences; then says what it did.
-async fn set_up_agents_with_defaults() -> Result<()> {
-    let exe = setup::exe()?;
-    let found = setup::detect(&exe);
-    let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
-    let sp = spinner();
-    sp.start("Setting up your agents...");
-    crate::stop_daemon().await;
-    let out = setup::apply(&exe, &ids, &[], Some(true), false).await;
-    sp.stop(match out.agents.as_slice() {
-        [] => "No coding agents found on this machine (yet)".to_string(),
-        names => format!("Set up {}", and_list(names)),
-    });
-    if out.service == Some(true) {
-        log::success("Runs in the background, from login")?;
-    }
-    for n in &out.notes {
-        log::warning(n)?;
-    }
-    Ok(())
-}
-
-/// `a, b and c`.
-fn and_list(items: &[&str]) -> String {
-    match items {
-        [] => String::new(),
-        [one] => one.to_string(),
-        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
-    }
 }
 
 /// Which agents are on Reason Network, the background service, and how teammates' messages are handled.
@@ -210,8 +179,8 @@ pub async fn agents_and_preferences() -> Result<()> {
         .interact()?;
     let mut cfg = Config::load_strict().map_err(|e| anyhow!("fix {} first: {e}", crate::paths::config().display()))?;
     cfg.inbound.default = select("When a teammate's agent messages one of yours")
-        .item(Policy::Accept, "Deliver it", "recommended")
-        .item(Policy::Hold, "Hold it until I approve", format!("you approve with `{CLI} held`"))
+        .item(Policy::Hold, "Hold it until I approve", format!("recommended; review with `{CLI} held`"))
+        .item(Policy::Accept, "Deliver it", "allows teammates to send directly to your agents")
         .initial_value(cfg.inbound.default)
         .interact()?;
     cfg.share_paths = confirm("Show teammates your full working directories? (otherwise just the folder name)")
@@ -264,7 +233,7 @@ pub async fn show_code(me: bool) -> Result<()> {
     note(
         format!("Invite code: {}", i.code),
         format!(
-            "On {who}: {unix}\n(on Windows: {windows})\n(or `{AGENT_NAME} join {}` if it's there already)\nWorks once, within {}h, while this machine is online.",
+            "First build from https://github.com/StarRayOne/reason-network/blob/hardened/FORK.md.\nOn {who}: {unix}\n(on Windows: {windows})\n(or `{AGENT_NAME} join {} --no-setup` if it's there already)\nWorks once, within {}h, while this machine is online.",
             i.code, i.hours
         ),
     )?;

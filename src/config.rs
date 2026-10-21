@@ -47,8 +47,8 @@ pub struct Inbound {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Policy {
-    #[default]
     Accept,
+    #[default]
     Hold,
     Refuse,
 }
@@ -62,7 +62,7 @@ impl Default for Config {
             lan: true,
             tray: true,
             reason: false,
-            auto_update: true,
+            auto_update: false,
             inbound: Inbound::default(),
             folders: BTreeMap::new(),
         }
@@ -71,7 +71,7 @@ impl Default for Config {
 
 impl Default for Inbound {
     fn default() -> Self {
-        Inbound { default: Policy::Accept, people: BTreeMap::new() }
+        Inbound { default: Policy::Hold, people: BTreeMap::new() }
     }
 }
 
@@ -260,6 +260,16 @@ pub fn off_by(folder: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_security_settings_hold_messages_and_disable_updates() {
+        for text in ["", "person = 'dima'", "[inbound]\n[inbound.people]\nalice = 'accept'"] {
+            let cfg: Config = toml::from_str(text).unwrap();
+            assert!(!cfg.auto_update);
+            assert_eq!(cfg.policy_for("unknown"), Policy::Hold);
+        }
+        assert_eq!(Policy::default(), Policy::Hold);
+    }
 
     fn folders(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()

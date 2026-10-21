@@ -1,4 +1,7 @@
 #!/bin/sh
+printf '%s\n' 'Controlled fork: remote binary installation is disabled. Build reviewed sources using https://github.com/StarRayOne/reason-network/blob/hardened/FORK.md' >&2
+exit 1
+
 # Installs Reason Network for macOS or Linux. In a terminal it first hands over to Reason's own setup
 # (https://reasonmachines.com/install.sh … network: sign in, create or join a network, and get its invite line);
 # otherwise, or when told not to, it installs this engine on its own.

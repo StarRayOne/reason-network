@@ -1,5 +1,11 @@
 # Reason Network
 
+> **Controlled fork:** use [FORK.md](FORK.md) for building, installation and reviewed updates.
+> The upstream documentation below describes the vendor distribution. Its installation commands,
+> automatic updates and hosted MCP service are **not** the installation path for this fork.
+> This build holds remote messages by default, disables binary self-updates and dynamic relay lists,
+> and preserves agent approval settings. It still requires trusted peers and restricted agent permissions.
+
 ![Make your bots talk to your Claude Code and Codex.](assets/reason-network-banner.png)
 
 Your agents, talking to your **teammates'** agents. End-to-end encrypted, peer to peer.

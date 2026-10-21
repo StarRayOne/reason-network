@@ -663,8 +663,15 @@ impl Net {
     async fn run_link(self: Arc<Self>, conn: Connection, outgoing: bool) -> Result<()> {
         let peer = conn.remote_id();
         let daemon = self.daemon.upgrade().ok_or_else(|| anyhow!("shutting down"))?;
-        let team = daemon.team_id().ok_or_else(|| anyhow!("not in a team"))?;
         let (mut send, mut recv) = if outgoing { conn.open_bi().await? } else { conn.accept_bi().await? };
+        let presence = daemon.presence().await;
+        // A dial or stream setup may finish after this peer was removed and its old link disconnected.
+        // Recheck after every setup await, before registering the link or sending any private data.
+        if !daemon.is_member(&peer) {
+            conn.close(403u32.into(), b"not a member of this team");
+            bail!("{} is no longer a member", peer.fmt_short());
+        }
+        let team = daemon.team_id().ok_or_else(|| anyhow!("not in a team"))?;
 
         // Both sides may dial at once. Both keep the connection dialed by the smaller id.
         let dialer = if outgoing { self.me } else { peer };
@@ -696,7 +703,7 @@ impl Net {
         if let Some(state) = daemon.team_state() {
             let _ = tx.send(for_peer(&Wire::State { state: Box::new(state) }, &peer));
         }
-        let _ = tx.send(Wire::Presence { presence: daemon.presence().await });
+        let _ = tx.send(Wire::Presence { presence });
         for msg in daemon.outbox_for(&peer) {
             let _ = tx.send(Wire::Msg { msg });
         }

@@ -1,4 +1,4 @@
-//! `setup`: wires Reason Network into every agent on this machine (MCP server, plus hooks where the agent has them) and
+//! `setup`: wires Reason Network into explicitly selected agents (MCP server, plus hooks where the agent has them) and
 //! installs the daemon as a login service. `setup --remove` undoes it. Every file it edits
 //! is backed up once, as `<file>.bak-reason`. Also `doctor`.
 //!
@@ -92,6 +92,33 @@ fn read_json(path: &Path) -> Result<Value> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
         Err(e) => Err(e.into()),
     }
+}
+
+fn read_toml(path: &Path) -> Result<toml_edit::DocumentMut> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    text.parse().with_context(|| format!("parsing {}", path.display()))
+}
+
+/// Keep user-owned per-server policy and tool restrictions when refreshing our transport settings.
+fn existing_server(item: Option<&toml_edit::Item>) -> Result<toml_edit::Table> {
+    let mut table = toml_edit::Table::new();
+    if let Some(item) = item {
+        let existing = item.as_table_like().ok_or_else(|| anyhow!("{AGENT_NAME} MCP settings aren't a table"))?;
+        for (key, value) in existing.iter() {
+            table.insert(key, value.clone());
+        }
+    }
+    Ok(table)
+}
+
+fn merge_server(servers: &mut Map<String, Value>, settings: Value) -> Result<()> {
+    let server = obj(servers.entry(AGENT_NAME).or_insert_with(|| json!({})))?;
+    server.extend(settings.as_object().expect("MCP settings are objects").clone());
+    Ok(())
 }
 
 /// Writes `content` if it differs, after backing up the original once. Returns whether anything changed.
@@ -227,10 +254,6 @@ fn changed(path: &Path, did: bool) -> String {
 fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let Some(bin) = agent::find_bin("claude") else { return Ok(None) };
     let mut r = Report { agent: "Claude Code", lines: Vec::new(), notes: Vec::new() };
-    // A settings file it can't read is left alone: the rest of the setup still goes ahead.
-    if let Err(e) = claude_allow_ask(remove, dry, &mut r) {
-        r.notes.push(format!("couldn't allow ask_user in Claude Code's settings ({e:#}): it asks once to allow it"));
-    }
     let get = |name: &str| -> Result<(bool, bool)> {
         let out = Command::new(&bin).args(["mcp", "get", name]).stdin(std::process::Stdio::null()).output()?;
         let existing = out.status.success();
@@ -283,32 +306,6 @@ fn claude(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     Ok(Some(r))
 }
 
-/// `ask_user` only shows the person a pop-up, so it is allowed: it never waits on a prompt in a terminal nobody is
-/// watching. The other tools keep Claude Code's own permission prompts.
-fn claude_allow_ask(remove: bool, dry: bool, r: &mut Report) -> Result<()> {
-    let rule = format!("mcp__{AGENT_NAME}__ask_user");
-    let path = paths::claude_dir().join("settings.json");
-    let mut v = read_json(&path)?;
-    let perms = obj(obj(&mut v)?.entry("permissions").or_insert_with(|| json!({})))?;
-    let Some(allow) = perms.entry("allow").or_insert_with(|| json!([])).as_array_mut() else {
-        return Err(anyhow!("{}: permissions.allow isn't a list", path.display()));
-    };
-    if remove {
-        allow.retain(|x| *x != rule);
-    } else if !allow.iter().any(|x| *x == rule) {
-        allow.push(json!(rule));
-    }
-    // Nothing of the user's own left: no empty lists behind.
-    if allow.is_empty() {
-        perms.remove("allow");
-    }
-    if perms.is_empty() {
-        obj(&mut v)?.remove("permissions");
-    }
-    r.lines.push(changed(&path, write_json(&path, &v, dry)?));
-    Ok(())
-}
-
 // ---- Codex ----
 
 fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
@@ -319,8 +316,7 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let mut r = Report { agent: "Codex", lines: Vec::new(), notes: Vec::new() };
 
     let cfg_path = dir.join("config.toml");
-    let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {}", cfg_path.display()))?;
+    let mut doc = read_toml(&cfg_path)?;
     if let Some(servers) = doc.get_mut("mcp_servers").and_then(|t| t.as_table_like_mut()) {
         let ours = servers
             .get(LEGACY_NAME)
@@ -340,7 +336,7 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         if let Some(t) = servers.as_table_mut() {
             t.set_implicit(true);
         }
-        let mut t = toml_edit::Table::new();
+        let mut t = existing_server(servers.get(AGENT_NAME))?;
         t["command"] = toml_edit::value(exe.display().to_string());
         t["args"] = toml_edit::value(toml_edit::Array::from_iter(["mcp"]));
         let mut env = toml_edit::InlineTable::new();
@@ -351,7 +347,6 @@ fn codex(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         t["env"] = toml_edit::value(env);
         // Room for check_inbox(wait_secs) long-polls.
         t["tool_timeout_sec"] = toml_edit::value(660);
-        t["default_tools_approval_mode"] = toml_edit::value("approve");
         servers[AGENT_NAME] = toml_edit::Item::Table(t);
     }
     r.lines.push(changed(&cfg_path, write_file(&cfg_path, &doc.to_string(), dry)?));
@@ -397,8 +392,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     let mut r = Report { agent: "Grok CLI", lines: Vec::new(), notes: Vec::new() };
 
     let cfg_path = dir.join("config.toml");
-    let text = std::fs::read_to_string(&cfg_path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {}", cfg_path.display()))?;
+    let mut doc = read_toml(&cfg_path)?;
     if remove {
         if let Some(servers) = doc.get_mut("mcp_servers").and_then(|t| t.as_table_like_mut()) {
             servers.remove(AGENT_NAME);
@@ -408,7 +402,7 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         if let Some(t) = servers.as_table_mut() {
             t.set_implicit(true);
         }
-        let mut t = toml_edit::Table::new();
+        let mut t = existing_server(servers.get(AGENT_NAME))?;
         t["command"] = toml_edit::value(exe.display().to_string());
         t["args"] = toml_edit::value(toml_edit::Array::from_iter(["mcp"]));
         let mut env = toml_edit::InlineTable::new();
@@ -422,7 +416,6 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         t["tool_timeout_sec"] = toml_edit::value(660);
         servers[AGENT_NAME] = toml_edit::Item::Table(t);
     }
-    grok_allow(&mut doc, remove);
     r.lines.push(changed(&cfg_path, write_file(&cfg_path, &doc.to_string(), dry)?));
 
     let hooks_path = dir.join(format!("hooks/{AGENT_NAME}.json"));
@@ -457,32 +450,6 @@ fn grok(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     Ok(Some(r))
 }
 
-/// grok asks before every MCP tool call unless a rule allows it.
-fn grok_allow(doc: &mut toml_edit::DocumentMut, remove: bool) {
-    let rule = format!("MCPTool({AGENT_NAME}__*)");
-    if remove {
-        if let Some(permission) = doc.get_mut("permission").and_then(|p| p.as_table_like_mut()) {
-            if let Some(allow) = permission.get_mut("allow").and_then(|a| a.as_array_mut()) {
-                allow.retain(|v| v.as_str() != Some(rule.as_str()));
-                if allow.is_empty() {
-                    permission.remove("allow");
-                }
-            }
-            if permission.is_empty() {
-                doc.remove("permission");
-            }
-        }
-        return;
-    }
-    let allow = doc.entry("permission").or_insert(toml_edit::table())["allow"]
-        .or_insert(toml_edit::value(toml_edit::Array::new()));
-    if let Some(allow) = allow.as_array_mut()
-        && !allow.iter().any(|v| v.as_str() == Some(rule.as_str()))
-    {
-        allow.push(rule);
-    }
-}
-
 // ---- Cursor ----
 
 fn cursor(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
@@ -498,10 +465,10 @@ fn cursor(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if remove {
         servers.remove(AGENT_NAME);
     } else {
-        servers.insert(
-            AGENT_NAME.into(),
+        merge_server(
+            servers,
             json!({ "type": "stdio", "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "cursor" } }),
-        );
+        )?;
     }
     r.lines.push(changed(&mcp_path, write_json(&mcp_path, &v, dry)?));
 
@@ -538,10 +505,10 @@ fn gemini(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if remove {
         servers.remove(AGENT_NAME);
     } else {
-        servers.insert(
-            AGENT_NAME.into(),
-            json!({ "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "gemini" }, "timeout": 660000, "trust": true }),
-        );
+        merge_server(
+            servers,
+            json!({ "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "gemini" }, "timeout": 660000 }),
+        )?;
     }
     let group = |event: &str, timeout: u64| json!({ "matcher": "*", "hooks": [{ "type": "command", "name": format!("{AGENT_NAME}-{event}"), "command": shell_cmd(exe, &format!("hook gemini {event}")), "timeout": timeout }] });
     let groups = vec![
@@ -575,10 +542,12 @@ fn copilot(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
     if remove {
         servers.remove(AGENT_NAME);
     } else {
-        servers.insert(
-            AGENT_NAME.into(),
-            json!({ "type": "local", "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "copilot" }, "tools": ["*"], "timeout": 660000 }),
-        );
+        merge_server(
+            servers,
+            json!({ "type": "local", "command": exe.display().to_string(), "args": ["mcp"], "env": { "REASON_NETWORK_AGENT": "copilot" }, "timeout": 660000 }),
+        )?;
+        // This is Copilot's tool availability list, not a permission grant. Keep any user restriction.
+        obj(servers.get_mut(AGENT_NAME).expect("server was merged"))?.entry("tools").or_insert(json!(["*"]));
     }
     r.lines.push(changed(&mcp_path, write_json(&mcp_path, &v, dry)?));
 
@@ -627,10 +596,10 @@ fn opencode(exe: &Path, remove: bool, dry: bool) -> Result<Option<Report>> {
         if remove {
             mcp.remove(AGENT_NAME);
         } else {
-            mcp.insert(
-                AGENT_NAME.into(),
+            merge_server(
+                mcp,
                 json!({ "type": "local", "command": [exe.display().to_string(), "mcp"], "environment": { "REASON_NETWORK_AGENT": "opencode" }, "enabled": true }),
-            );
+            )?;
         }
         r.lines.push(changed(&path, write_json(&path, &v, dry)?));
     }
@@ -1390,10 +1359,30 @@ pub async fn apply(exe: &Path, install: &[&str], remove: &[&str], service: Optio
     out
 }
 
-/// Non-interactive setup: every agent found (or, with `remove`, every agent wired).
-pub async fn run(dry: bool, remove: bool, no_service: bool) -> Result<()> {
+/// Validate the complete selection before making any changes.
+fn selected_agents<'a>(selected: &[String], all: bool, found: &'a [Found]) -> Result<Vec<&'a str>> {
+    if selected.is_empty() && !all {
+        return Err(anyhow!("choose `setup --agent <agent>` (repeatable), or explicitly use `setup --all-agents`"));
+    }
+    if all && !selected.is_empty() {
+        return Err(anyhow!("use either --agent or --all-agents, not both"));
+    }
+    for id in selected {
+        if !AGENTS.iter().any(|a| a.id == id) {
+            return Err(anyhow!("unknown agent {id:?}; supported: {}", AGENTS.map(|a| a.id).join(", ")));
+        }
+        if !found.iter().any(|f| f.id == id) {
+            return Err(anyhow!("selected agent {id:?} is not installed; no setup changes were made"));
+        }
+    }
+    Ok(found.iter().filter(|f| all || selected.iter().any(|id| id == f.id)).map(|f| f.id).collect())
+}
+
+/// Non-interactive setup changes only an explicit agent selection.
+pub async fn run(dry: bool, remove: bool, no_service: bool, selected: &[String], all: bool) -> Result<()> {
     let exe = exe()?;
     let found = detect(&exe);
+    let ids = selected_agents(selected, all, &found)?;
     let verb = if dry {
         "Would change"
     } else if remove {
@@ -1407,7 +1396,6 @@ pub async fn run(dry: bool, remove: bool, no_service: bool) -> Result<()> {
             "  no supported agents found (Claude Code, Codex, Grok CLI, Cursor, Gemini CLI, Copilot CLI, opencode, pi, DeepSeek Harness, Reason)"
         );
     }
-    let ids: Vec<&str> = found.iter().map(|f| f.id).collect();
     let (install, removing): (&[&str], &[&str]) = if remove { (&[], &ids) } else { (&ids, &[]) };
     let out = apply(&exe, install, removing, (!no_service).then_some(!remove), dry).await;
     for l in &out.lines {
@@ -1420,13 +1408,6 @@ pub async fn run(dry: bool, remove: bool, no_service: bool) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Setup without the report, for `--json`: the agents it set up.
-pub async fn quietly() -> Result<Vec<&'static str>> {
-    let exe = exe()?;
-    let ids: Vec<&str> = detect(&exe).iter().map(|f| f.id).collect();
-    Ok(apply(&exe, &ids, &[], Some(true), false).await.agents)
 }
 
 /// Read-only checks, one line each.
@@ -1494,18 +1475,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn grok_allow_rule() {
-        let mut doc: toml_edit::DocumentMut = "[permission]\nallow = [\"Bash(ls)\"]\n".parse().unwrap();
-        grok_allow(&mut doc, false);
-        grok_allow(&mut doc, false);
-        assert_eq!(doc.to_string(), "[permission]\nallow = [\"Bash(ls)\", \"MCPTool(reason-network__*)\"]\n");
-        grok_allow(&mut doc, true);
-        assert_eq!(doc.to_string(), "[permission]\nallow = [\"Bash(ls)\"]\n");
-        let mut doc = toml_edit::DocumentMut::new();
-        grok_allow(&mut doc, false);
-        assert!(doc.to_string().contains("MCPTool(reason-network__*)"));
-        grok_allow(&mut doc, true);
-        assert_eq!(doc.to_string(), "");
+    fn setup_requires_an_explicit_complete_selection() {
+        let found = [
+            Found { id: "codex", name: "Codex", hint: "", wired: false },
+            Found { id: "grok", name: "Grok CLI", hint: "", wired: false },
+        ];
+        let ids = |s: &[&str]| s.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        assert!(selected_agents(&[], false, &found).is_err());
+        assert!(selected_agents(&ids(&["unknown"]), false, &found).is_err());
+        assert!(selected_agents(&ids(&["codex", "claude"]), false, &found).is_err());
+        assert!(selected_agents(&ids(&["codex"]), true, &found).is_err());
+        assert_eq!(selected_agents(&ids(&["grok", "grok"]), false, &found).unwrap(), ["grok"]);
+        assert_eq!(selected_agents(&[], true, &found).unwrap(), ["codex", "grok"]);
+    }
+
+    #[test]
+    fn refreshing_transport_keeps_existing_tool_restrictions() {
+        let doc: toml_edit::DocumentMut =
+            "[server]\ndefault_tools_approval_mode = 'prompt'\ndisabled_tools = ['send_message']\n".parse().unwrap();
+        let mut server = existing_server(doc.get("server")).unwrap();
+        server["command"] = toml_edit::value("/new/reason-network");
+        assert_eq!(server["default_tools_approval_mode"].as_str(), Some("prompt"));
+        assert_eq!(server["disabled_tools"].as_array().unwrap().get(0).unwrap().as_str(), Some("send_message"));
+        assert!(existing_server(None).unwrap().get("default_tools_approval_mode").is_none());
+
+        let mut servers = serde_json::from_value::<Map<String, Value>>(json!({
+            "reason-network": { "command": "/old/engine", "trust": false, "includeTools": ["list_team"] }
+        }))
+        .unwrap();
+        merge_server(&mut servers, json!({"command": "/new/engine", "args": ["mcp"]})).unwrap();
+        assert_eq!(servers[AGENT_NAME]["trust"], false);
+        assert_eq!(servers[AGENT_NAME]["includeTools"], json!(["list_team"]));
+        assert_eq!(servers[AGENT_NAME]["command"], "/new/engine");
+        assert!(existing_server(Some(&toml_edit::value("invalid"))).is_err());
     }
 
     #[test]

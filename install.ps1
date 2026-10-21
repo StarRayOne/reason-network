@@ -1,3 +1,5 @@
+throw 'Controlled fork: remote binary installation is disabled. Build reviewed sources using https://github.com/StarRayOne/reason-network/blob/hardened/FORK.md'
+
 # Installs the Reason Network engine on its own for Windows (without Reason sign-in: names aren't verified). In PowerShell:
 #
 #   irm <this url> | iex                                                  install, then set up (start or join a team)

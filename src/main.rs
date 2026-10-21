@@ -39,8 +39,8 @@ pub const AGENT_NAME: &str = "reason-network";
 /// `paths` moves the state it kept under it.
 pub const LEGACY_NAME: &str = "tincan";
 
-/// Where releases are published: a standalone install and its updates come from here.
-pub const REPO: &str = "reason-machines/reason-network";
+/// The controlled source repository. Updates require a reviewed, local build.
+pub const REPO: &str = "StarRayOne/reason-network";
 
 /// Whether the Reason CLI installed this binary (in `~/.reason/bin`): then it sets up and updates with the CLI, and
 /// people type `reason network`.
@@ -74,29 +74,10 @@ impl std::fmt::Display for Engine {
     }
 }
 
-/// The one line that installs this engine on its own (without signing in to Reason) and runs `reason-network <args>`: for
-/// macOS and Linux, and for Windows.
+/// Join commands for an already installed, locally built engine. Never fetch or execute a remote installer.
 pub fn install_lines(args: &str) -> [String; 2] {
-    let base = format!("https://github.com/{REPO}/releases/latest/download");
-    [
-        format!("curl -fsSL {base}/install.sh | sh -s -- {args}"),
-        format!("powershell -c \"& ([scriptblock]::Create((irm {base}/install.ps1))) {args}\""),
-    ]
-}
-
-/// The install script, run without questions, installing into `dir`.
-pub fn installer(dir: &std::path::Path) -> std::process::Command {
-    let base = format!("https://github.com/{REPO}/releases/latest/download");
-    let mut cmd;
-    if cfg!(windows) {
-        cmd = std::process::Command::new("powershell");
-        cmd.args(["-NoProfile", "-NonInteractive", "-Command", &format!("irm {base}/install.ps1 | iex")]);
-    } else {
-        cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(format!("s=\"$(curl -fsSL {base}/install.sh)\" && printf '%s\\n' \"$s\" | sh"));
-    }
-    cmd.env("REASON_NETWORK_BIN_DIR", dir).env("REASON_NETWORK_NO_PROMPT", "1");
-    cmd
+    let command = format!("reason-network join {args} --no-setup");
+    [command.clone(), command]
 }
 
 /// The team link: Reason Network's join page, carrying the `ticket`.
@@ -106,7 +87,9 @@ pub fn join_url(ticket: &str) -> String {
 
 /// The invite line: what a person pastes to their agent to join the team.
 pub fn invite_line(link: &str) -> String {
-    format!("Join the Reason Network: {link}")
+    format!(
+        "Join the Reason Network: {link}\nUse the controlled source build: https://github.com/{REPO}/blob/hardened/FORK.md"
+    )
 }
 
 #[derive(Parser)]
@@ -265,10 +248,16 @@ enum Cmd {
         /// Don't install the background service
         #[arg(long)]
         no_service: bool,
+        /// Configure only this installed agent (repeat for more agents)
+        #[arg(long = "agent", value_name = "AGENT", conflicts_with = "all_agents")]
+        agents: Vec<String>,
+        /// Explicitly configure every detected agent
+        #[arg(long)]
+        all_agents: bool,
     },
     /// Check that everything is working
     Doctor,
-    /// Update to the latest release (with the Reason CLI, `reason update` does it)
+    /// Explain how to update this controlled build from reviewed source
     Upgrade,
     /// Called by agents' hooks
     #[command(hide = true)]
@@ -346,7 +335,7 @@ async fn main() -> Result<()> {
             }
             if !in_team {
                 println!(
-                    "Not in a team yet. Run `{CLI}` in a terminal to get set up (or `{CLI} init <team>` / `{CLI} join <code>`)."
+                    "Not in a team yet. Run `{CLI}` in a terminal to get set up (or `{CLI} init <team> --no-setup` / `{CLI} join <code> --no-setup`)."
                 );
                 return Ok(());
             }
@@ -505,10 +494,15 @@ async fn cli(cmd: Cmd) -> Result<()> {
             println!("Whoever pastes this line to their coding agent joins the team. `{CLI} link --new` replaces it.");
         }
         Cmd::Invite { me: false, code: false, .. } => Box::pin(cli(Cmd::Link { new: false, json: false })).await?,
-        Cmd::Setup { dry_run: false, remove: false, no_service: false } if wizard::interactive() => {
+        Cmd::Setup { dry_run: false, remove: false, no_service: false, ref agents, all_agents: false }
+            if agents.is_empty() && wizard::interactive() =>
+        {
             wizard::guided(wizard::setup_agents()).await?
         }
         Cmd::Init { team, person, no_setup, relay, proof, json } => {
+            if !no_setup {
+                bail!("use `init --no-setup`, then `setup --agent <agent>` to choose agents explicitly");
+            }
             let Some(team) = team else {
                 bail!("name the team: `{CLI} init <team>` (or run it in a terminal to be asked)")
             };
@@ -516,30 +510,23 @@ async fn cli(cmd: Cmd) -> Result<()> {
             let t: TeamInfo = link.call(req).await?;
             wait_exit(daemon_pid()).await;
             if json {
-                let agents = if no_setup { None } else { Some(setup::quietly().await?) };
-                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&Link::new(None), agents).await?)?));
+                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&Link::new(None), None).await?)?));
                 return Ok(());
             }
             println!("Created team {}. You are {} on {}.", t.name, t.person, t.machine);
-            if !no_setup {
-                println!();
-                setup::run(false, false, false).await?;
-            }
             let l: LinkInfo = Link::new(None).call(Request::Link { new: false }).await?;
             println!("\nInvite people with this line:\n{}", invite_line(&l.url));
         }
         Cmd::Join { invite, person, no_setup, proof, json } => {
+            if !no_setup {
+                bail!("use `join --no-setup`, then `setup --agent <agent>` to choose agents explicitly");
+            }
             let Some(invite) = invite else { bail!("give the invite code: `{CLI} join <code>`") };
             let req = Request::Join { ticket: invite, person: default_person(person), proof };
             let t: TeamInfo = link.call(req).await?;
             wait_exit(daemon_pid()).await;
-            let agents = if no_setup || !json { None } else { Some(setup::quietly().await?) };
             if !json {
                 println!("Joined team {} as {} on {}.", shown(&t.name), t.person, t.machine);
-            }
-            if !no_setup && !json {
-                println!();
-                setup::run(false, false, false).await?;
             }
             // Give the new daemon a moment to reach teammates, then show them.
             let fresh = Link::new(None);
@@ -552,7 +539,7 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 }
             }
             if json {
-                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&fresh, agents).await?)?));
+                println!("{}", shown(&serde_json::to_string_pretty(&team_json(&fresh, None).await?)?));
                 return Ok(());
             }
             if let Ok(t) = fresh.call::<TeamInfo>(Request::Team).await {
@@ -573,18 +560,21 @@ async fn cli(cmd: Cmd) -> Result<()> {
                 );
             }
             println!(
-                "With the code, they run this, which installs the Reason Network engine and joins (their name unverified):\n"
+                "First build and install from https://github.com/{REPO}/blob/hardened/FORK.md. Then join (name unverified):\n"
             );
             println!("  {unix}\n");
             println!("On Windows, in PowerShell:\n\n  {windows}\n");
             println!(
-                "(or `{AGENT_NAME} join {}` if it's installed). Works once, within {}h, while this machine is online.",
+                "(or `{AGENT_NAME} join {} --no-setup` if it's installed). Works once, within {}h, while this machine is online.",
                 i.code, i.hours
             );
-            println!("If this machine will be offline, use the long form instead: {AGENT_NAME} join {}", i.ticket);
+            println!(
+                "If this machine will be offline, use the long form instead: {AGENT_NAME} join {} --no-setup",
+                i.ticket
+            );
             if me {
                 println!(
-                    "\nFor a cloud agent of yours (Grok Bot, Dots, Muse, …), send it: join my Reason Network team as {}: {}",
+                    "\nFor a cloud agent of yours (Grok Bot, Dots, Muse, …), use the controlled source build and join my Reason Network team as {}: {}",
                     default_person(None),
                     join_url(&i.ticket)
                 );
@@ -665,23 +655,14 @@ async fn cli(cmd: Cmd) -> Result<()> {
             let n: usize = link.call(Request::Settle { ids, release: false }).await?;
             println!("Dropped {n}.");
         }
-        Cmd::Setup { dry_run, remove, no_service } => setup::run(dry_run, remove, no_service).await?,
+        Cmd::Setup { dry_run, remove, no_service, agents, all_agents } => {
+            setup::run(dry_run, remove, no_service, &agents, all_agents).await?
+        }
         Cmd::Doctor => setup::doctor().await?,
         Cmd::Upgrade => {
-            if managed() {
-                bail!("the network engine updates with the reason CLI: update reason, then run `{CLI} setup`");
-            }
-            let dir = util::current_exe()?.parent().map(|d| d.to_path_buf()).unwrap_or_default();
-            let exe = dir.join(format!("{AGENT_NAME}{}", std::env::consts::EXE_SUFFIX));
-            let waiting = migrate::waiting(&exe);
-            if !installer(&dir).status()?.success() {
-                bail!("upgrade failed");
-            }
-            if waiting {
-                migrate::keep_waiting_copy(&exe);
-            }
-            stop_daemon().await;
-            println!("The daemon restarted on the new version. Restart agent sessions to update their tools.");
+            bail!(
+                "automatic binary replacement is disabled in this controlled build; review and build the source yourself: https://github.com/{REPO}/blob/hardened/FORK.md"
+            );
         }
         Cmd::Stop => {
             if !stop_daemon().await {
@@ -821,6 +802,26 @@ pub async fn stop_daemon() -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn controlled_build_refuses_remote_upgrade() {
+        let error = cli(Cmd::Upgrade).await.unwrap_err().to_string();
+        assert!(error.contains("binary replacement is disabled"));
+        assert!(error.contains("StarRayOne/reason-network/blob/hardened/FORK.md"));
+    }
+
+    #[test]
+    fn setup_cli_accepts_explicit_agents_and_rejects_conflicting_all() {
+        let cmd =
+            Cli::try_parse_from(["reason-network", "setup", "--agent", "codex", "--agent", "grok", "--no-service"])
+                .unwrap()
+                .cmd
+                .unwrap();
+        assert!(
+            matches!(cmd, Cmd::Setup { agents, all_agents: false, no_service: true, .. } if agents == ["codex", "grok"])
+        );
+        assert!(Cli::try_parse_from(["reason-network", "setup", "--agent", "codex", "--all-agents"]).is_err());
+    }
+
     #[test]
     fn in_a_folder_that_is_off_the_terminal_goes_by_no_folder_and_an_agents_shell_gets_nothing() {
         assert_eq!(terminal_cwd("/work/api".into(), false, true).unwrap(), "/work/api");
@@ -924,7 +925,10 @@ mod tests {
             (v["team_id"].as_str(), v["team_name"].as_str()),
             (Some("00112233445566778899aabbccddeeff"), Some("vibes"))
         );
-        assert_eq!(v["invite_line"], "Join the Reason Network: https://reasonmachines.com/network/join/#rn1-AAAA");
+        assert_eq!(
+            v["invite_line"],
+            "Join the Reason Network: https://reasonmachines.com/network/join/#rn1-AAAA\nUse the controlled source build: https://github.com/StarRayOne/reason-network/blob/hardened/FORK.md"
+        );
         assert_eq!(
             (v["members"][0]["verified"].as_bool(), v["members"][0]["has_proof"].as_bool()),
             (Some(true), Some(true))
