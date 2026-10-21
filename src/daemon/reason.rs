@@ -196,7 +196,7 @@ fn first_words(title: &str) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::{io::Write, path::PathBuf};
+    use std::path::PathBuf;
 
     /// A stub `reason` whose `session list --fields …` fails with `narrow_err`, and whose plain list prints one live
     /// session, or fails with `plain_err`. Each call's arguments go to `calls`. Its folder goes when it does.
@@ -219,12 +219,14 @@ mod tests {
                 "#!/bin/sh\necho \"$*\" >> '{}'\ncase \" $* \" in *' --fields '*) echo '{narrow_err}' >&2; exit 1;; esac\n{plain}\n",
                 calls.display()
             );
-            // Written, synced and closed before it runs: still open for writing, it can't be run (ETXTBSY).
-            let mut f = std::fs::File::create(&bin).unwrap();
-            f.write_all(script.as_bytes()).unwrap();
-            f.sync_all().unwrap();
-            drop(f);
-            util::chmod(&bin, 0o755).unwrap();
+            // Written by a child: a file this process has open for writing, which a test forking at that moment
+            // holds open until its exec, can't be run (ETXTBSY).
+            let written = std::process::Command::new("sh")
+                .args(["-c", "printf '%s' \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh", &script])
+                .arg(&bin)
+                .status()
+                .unwrap();
+            assert!(written.success());
             Stub { dir, bin, calls }
         }
 
