@@ -35,6 +35,16 @@ The manually dispatched `controlled-build` GitHub workflow builds in a clean hos
 
 ## Install and connect selected agents
 
+For the prepared first installation on an Apple Silicon Mac, run `sh install-controlled-macos.sh` from an ordinary Terminal. The script requires the artifact from [successful controlled build 39577655309](https://github.com/StarRayOne/reason-network/actions/runs/39577655309) in `.build/artifact`; its exact source revision is `7a7d2f0efc1b146e76e8f464f219b2f53ba13ca9`. It verifies the commit and checksum, performs a local message/MCP smoke test in isolated temporary state, records configuration fingerprints, installs, and verifies preserved settings and the login service. It refuses an existing Reason Network binary or state instead of overwriting them. This binary passed Clippy and all 136 Rust tests; its local daemon smoke test and final installation require a normal Terminal because the Codex environment denied Unix socket creation and escalation.
+
+For a fresh checkout, obtain that artifact first:
+
+```sh
+gh run download 39577655309 --repo StarRayOne/reason-network \
+  --name reason-network-controlled-aarch64-apple-darwin --dir .build/artifact
+sh install-controlled-macos.sh
+```
+
 Install the verified binary as `~/.local/bin/reason-network`, outside the vendor-managed `~/.reason/bin` folder. Keep the previous binary for rollback when upgrading. Keep the state directory `~/.reason/network` owned by your user with mode 0700; its keys and invite links are private.
 
 Before starting, write `~/.reason/network/config.toml`:
