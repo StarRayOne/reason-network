@@ -209,12 +209,9 @@ impl Daemon {
                         }
                     }
                 };
-                if state != "refused" {
-                    // Counting never stops a message.
+                // Counting never stops a message. One to another machine counts once that machine takes it.
+                if here && state != "refused" {
                     let _ = g.store.count(now, Counted::Sent);
-                    if here {
-                        let _ = g.store.count(now, Counted::Received);
-                    }
                 }
                 if notify && here && state != "refused" {
                     note = format!("{note}; {}", self.notify(&msg).1);
@@ -531,7 +528,6 @@ impl Daemon {
             // A held message's files are saved only once the person approves it.
             let held = policy == Policy::Hold;
             g.store.insert(&mut msg, held)?;
-            let _ = g.store.count(util::now_ms(), Counted::Received);
             let (state, note) = match key {
                 _ if held => ("held".into(), format!("held until {} approves it", self.person)),
                 Some(key) => self.deliver(&mut g, &key, vec![msg.clone()], msg.wake),
