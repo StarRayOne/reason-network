@@ -11,7 +11,7 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -22,7 +22,6 @@ const FIELDS: &str = "title,repo,branch,status,finished_at,is_archived";
 /// A CLI from before `--fields` refuses it; the plain list is read for this long before trying again (the CLI
 /// updates itself).
 const PLAIN_FOR: Duration = Duration::from_secs(3600);
-static PLAIN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// The relay is started again this long after it stops, doubling up to `RELAY_MAX_WAIT` while it keeps stopping.
 const RELAY_WAIT: Duration = Duration::from_secs(30);
 const RELAY_MAX_WAIT: Duration = Duration::from_secs(600);
@@ -89,11 +88,19 @@ impl Daemon {
 
     async fn reason_sync(self: &Arc<Self>) -> Result<()> {
         let Some(bin) = agent::find_bin("reason") else { return Ok(()) };
-        let narrow = PLAIN_UNTIL.lock().unwrap().is_none_or(|until| Instant::now() >= until);
-        let mut out = list_sessions(&bin, narrow).await?;
-        if narrow && !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("--fields") {
-            *PLAIN_UNTIL.lock().unwrap() = Some(Instant::now() + PLAIN_FOR);
-            out = list_sessions(&bin, false).await?;
+        self.sync_from(&bin).await
+    }
+
+    async fn sync_from(self: &Arc<Self>, bin: &std::path::Path) -> Result<()> {
+        let narrow = self.plain_until.lock().unwrap().is_none_or(|until| Instant::now() >= until);
+        let mut out = list_sessions(bin, narrow).await?;
+        // Whatever the narrow list failed on, the plain one may still work. Only a CLI that refuses `--fields` is
+        // read plain for a while; anything else tries narrow again next time.
+        if narrow && !out.status.success() {
+            if String::from_utf8_lossy(&out.stderr).contains("--fields") {
+                *self.plain_until.lock().unwrap() = Some(Instant::now() + PLAIN_FOR);
+            }
+            out = list_sessions(bin, false).await?;
         }
         if !out.status.success() {
             bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
@@ -179,4 +186,65 @@ async fn list_sessions(bin: &std::path::Path, narrow: bool) -> Result<std::proce
 
 fn first_words(title: &str) -> String {
     util::slug(&title.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A stub `reason` whose `session list --fields …` fails with `narrow_err`, and whose plain list prints one live
+    /// session, or fails with `plain_err`. Each call's arguments go to `calls`.
+    fn stub(narrow_err: &str, plain_err: Option<&str>) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("reason-network-reason-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let calls = dir.join("calls");
+        let plain = match plain_err {
+            Some(e) => format!("echo '{e}' >&2; exit 1"),
+            None => r#"echo '{"items":[{"session_id":"r-1","status":"running","title":"Fix flaky billing test","finished_at":null,"is_archived":false}]}'"#.into(),
+        };
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \" $* \" in *' --fields '*) echo '{narrow_err}' >&2; exit 1;; esac\n{plain}\n",
+            calls.display()
+        );
+        let bin = dir.join("reason");
+        std::fs::write(&bin, script).unwrap();
+        util::chmod(&bin, 0o755).unwrap();
+        (bin, calls)
+    }
+
+    fn calls(path: &std::path::Path) -> Vec<bool> {
+        std::fs::read_to_string(path).unwrap().lines().map(|l| l.contains("--fields")).collect()
+    }
+
+    #[tokio::test]
+    async fn a_narrow_list_that_fails_for_another_reason_falls_back_to_the_plain_list() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let (bin, log) = stub("Reason: 400 Bad Request: unknown field: repo", None);
+        d.sync_from(&bin).await.unwrap();
+        assert!(d.inner.lock().unwrap().live.contains_key("reason:r-1"));
+        // Not a CLI that refuses `--fields`: the next time asks narrow again.
+        assert!(d.plain_until.lock().unwrap().is_none());
+        d.sync_from(&bin).await.unwrap();
+        assert_eq!(calls(&log), [true, false, true, false]);
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_refuses_fields_is_read_plain_for_a_while() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let (bin, log) = stub("Reason: Unknown option: --fields.", None);
+        d.sync_from(&bin).await.unwrap();
+        d.sync_from(&bin).await.unwrap();
+        assert!(d.inner.lock().unwrap().live.contains_key("reason:r-1"));
+        assert_eq!(calls(&log), [true, false, false]);
+    }
+
+    #[tokio::test]
+    async fn a_list_that_fails_either_way_is_one_error_and_one_plain_try() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let signed_out = "Reason: Not signed in. Run reason login.";
+        let (bin, log) = stub(signed_out, Some(signed_out));
+        assert_eq!(d.sync_from(&bin).await.unwrap_err().to_string(), signed_out);
+        assert!(d.plain_until.lock().unwrap().is_none());
+        assert_eq!(calls(&log), [true, false]);
+    }
 }
