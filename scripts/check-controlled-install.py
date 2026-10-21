@@ -33,7 +33,9 @@ if sys.argv[1] == 'before':
     print('Saved configuration fingerprints; no credential contents recorded.')
     sys.exit(0)
 
-assert settings_fingerprints() == json.loads(snapshot.read_text()), 'Settings outside the new MCP entries changed'
+before = json.loads(snapshot.read_text())
+after = settings_fingerprints()
+changed_settings = sorted(key for key in before.keys() | after.keys() if before.get(key) != after.get(key))
 binary = user_dir / '.local/bin/reason-network'
 state = user_dir / '.reason/network'
 assert stat.S_IMODE(state.stat().st_mode) == 0o700 and state.stat().st_uid == os.getuid()
@@ -62,4 +64,9 @@ for name in ('config.toml', 'machine.key', 'network.db', 'initial-team.json'):
     path = state / name
     assert path.exists() and stat.S_IMODE(path.stat().st_mode) == 0o600, name
 print(json.dumps({'installed':str(binary),'service':'running','agents':['claude','codex','grok'],
-                  'existing_settings':'preserved','inbound':'hold','state_mode':'0700','sha256':actual}))
+                  'existing_settings':'changed' if changed_settings else 'preserved',
+                  'changed_settings':changed_settings,'inbound':'hold','state_mode':'0700','sha256':actual}))
+if changed_settings:
+    sys.exit('Installation checks passed, but settings outside the Reason Network MCP entries changed: '
+             + ', '.join(changed_settings)
+             + '. Review the changes (including concurrent app updates); the original snapshot is retained.')
